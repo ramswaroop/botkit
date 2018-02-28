@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.event.ContextRefreshedEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.util.StringUtils;
 import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
@@ -14,6 +16,7 @@ import org.springframework.web.socket.client.WebSocketConnectionManager;
 import org.springframework.web.socket.client.standard.StandardWebSocketClient;
 
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -87,26 +90,68 @@ public abstract class Bot {
      * Construct a map of all the controller methods to handle RTM Events.
      */
     public Bot() {
-        Method[] methods = this.getClass().getMethods();
+        registerController(this);
+    }
+
+    /**
+     * Handle application context initialized event
+     * @param event application context event
+     */
+    @EventListener
+    public void handleContextRefresh(ContextRefreshedEvent event) {
+        Map<String, Object> handlers = event.getApplicationContext()
+            .getBeansWithAnnotation(Handler.class);
+
+        handlers.forEach((beanName, bean) -> {
+            Handler handler = bean.getClass().getAnnotation(Handler.class);
+            Class<? extends Bot>[] linkTo = handler.value();
+            if (linkTo.length == 0){
+                registerController(bean);
+            } else {
+                for (Class<? extends Bot> aLinkTo : linkTo) {
+                    if (aLinkTo.equals(this.getClass())) {
+                        registerController(bean);
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    /**
+     * Register controller in bot
+     * @param controllerPOJO controller with methods to handle RTM Events.
+     */
+    public void registerController(Object controllerPOJO) {
+        Method[] methods = controllerPOJO.getClass().getMethods();
         for (Method method : methods) {
             if (method.isAnnotationPresent(Controller.class)) {
                 Controller controller = method.getAnnotation(Controller.class);
                 EventType[] eventTypes = controller.events();
-                String pattern = controller.pattern();
+
                 String next = controller.next();
 
                 if (!StringUtils.isEmpty(next)) {
                     conversationMethodNames.add(next);
                 }
 
-                MethodWrapper methodWrapper = new MethodWrapper();
-                methodWrapper.setMethod(method);
-                methodWrapper.setPattern(pattern);
-                methodWrapper.setNext(next);
+                Pattern pattern = null;
+                String patternStr = controller.pattern();
+                if (!StringUtils.isEmpty(patternStr)) {
+                    pattern = Pattern.compile(patternStr);
+                }
 
-                if (!conversationMethodNames.contains(method.getName())) {
+                MethodWrapper methodWrapper = new MethodWrapper
+                    (controllerPOJO, method, pattern, next);
+
+                String methodName = method.getName();
+
+                assertMethodWrapper(methodWrapper);
+
+                if (!conversationMethodNames.contains(methodName)) {
                     for (EventType eventType : eventTypes) {
-                        List<MethodWrapper> methodWrappers = eventToMethodsMap.get(eventType.name());
+                        List<MethodWrapper> methodWrappers =
+                            eventToMethodsMap.get(eventType.name());
 
                         if (methodWrappers == null) {
                             methodWrappers = new ArrayList<>();
@@ -116,7 +161,7 @@ public abstract class Bot {
                         eventToMethodsMap.put(eventType.name(), methodWrappers);
                     }
                 }
-                methodNameMap.put(method.getName(), methodWrapper);
+                methodNameMap.put(methodName, methodWrapper);
             }
         }
     }
@@ -265,6 +310,47 @@ public abstract class Bot {
     }
 
     /**
+     * Assert the method wrapper compliant to the bot
+     */
+    private void assertMethodWrapper(MethodWrapper methodWrapper) {
+        Method method = methodWrapper.getMethod();
+        String methodName = method.getName();
+        if (methodNameMap.containsKey(methodName)) {
+            throw new AssertionError("Problem with method " + method.toGenericString() + ": "
+                + "Controller with method '" + methodName + "' " + "already exists. " + "All "
+                + "controllers methods names in the same Bot must be unique.");
+        }
+
+        Class<?>[] methodParams = method.getParameterTypes();
+
+        boolean methodParamsGood;
+
+        if (methodWrapper.getController() == this) {
+            methodParamsGood = methodParams.length >= 2 && methodParams.length <= 3 &&
+                methodParams[0].isAssignableFrom(WebSocketSession.class) && methodParams[1]
+                .isAssignableFrom(Event.class);
+
+            if (methodParams.length == 3) {
+                methodParamsGood = methodParamsGood && methodParams[2].isAssignableFrom(Matcher
+                    .class);
+            }
+        } else {
+            methodParamsGood = methodParams.length >= 3 && methodParams.length <= 4 &&
+                methodParams[0].isAssignableFrom(this.getClass()) &&
+                methodParams[1].isAssignableFrom(WebSocketSession.class) && methodParams[2]
+                .isAssignableFrom(Event.class);
+
+            if (methodParams.length == 4) {
+                methodParamsGood = methodParamsGood && methodParams[3].isAssignableFrom(Matcher
+                    .class);
+            }
+        }
+        if (!methodParamsGood)
+            throw new AssertionError("Problem with method " + method.toGenericString() + ": "
+                + "Method parameters not compliant. See @Controller java docs.");
+    }
+
+    /**
      * Encode the text before sending to Slack.
      * Learn <a href="https://api.slack.com/docs/formatting">more on message formatting in Slack</a>
      *
@@ -313,12 +399,7 @@ public abstract class Bot {
 
             if (methodWrappers != null) {
                 for (MethodWrapper methodWrapper : methodWrappers) {
-                    Method method = methodWrapper.getMethod();
-                    if (method.getParameterCount() == 3) {
-                        method.invoke(this, session, event, methodWrapper.getMatcher());
-                    } else {
-                        method.invoke(this, session, event);
-                    }
+                    invokeMethod(session, event, methodWrapper);
                 }
             }
         } catch (Exception e) {
@@ -342,12 +423,42 @@ public abstract class Bot {
                 EventType[] eventTypes = methodWrapper.getMethod().getAnnotation(Controller.class).events();
                 for (EventType eventType : eventTypes) {
                     if (eventType.name().equals(event.getType().toUpperCase())) {
-                        methodWrapper.getMethod().invoke(this, session, event);
+                        invokeMethod(session, event, methodWrapper);
                         return;
                     }
                 }
             } catch (Exception e) {
                 logger.error("Error invoking chained method: ", e);
+            }
+        }
+    }
+
+    /**
+     * Invoke concrete method
+     * @param session
+     * @param event
+     * @param methodWrapper
+     * @throws IllegalAccessException
+     * @throws InvocationTargetException
+     */
+    private void invokeMethod(WebSocketSession session, Event event, MethodWrapper methodWrapper)
+        throws IllegalAccessException, InvocationTargetException {
+        Method method = methodWrapper.getMethod();
+        Object controller = methodWrapper.getController();
+        if (controller == this) {
+            if (method.getParameterTypes()[method.getParameterCount() - 1]
+                .isAssignableFrom(Matcher.class)) {
+                method.invoke(controller, session, event, methodWrapper.getMatcher());
+            } else {
+                method.invoke(controller, session, event);
+            }
+        } else {
+            if (method.getParameterTypes()[method.getParameterCount() - 1]
+                .isAssignableFrom(Matcher.class)) {
+                method.invoke(controller, this, session, event,
+                    methodWrapper.getMatcher());
+            } else {
+                method.invoke(controller, this, session, event);
             }
         }
     }
@@ -368,13 +479,14 @@ public abstract class Bot {
 
             while (listIterator.hasNext()) {
                 MethodWrapper methodWrapper = listIterator.next();
-                String pattern = methodWrapper.getPattern();
+                Pattern pattern = methodWrapper.getPattern();
                 String text = event.getText();
 
-                if (!StringUtils.isEmpty(pattern) && !StringUtils.isEmpty(text)) {
-                    Pattern p = Pattern.compile(pattern);
-                    Matcher m = p.matcher(text);
+                if ((pattern != null) && !StringUtils.isEmpty(text)) {
+                    Matcher m = pattern.matcher(text);
                     if (m.find()) {
+                        // Clone for thread safe compatibility
+                        methodWrapper = new MethodWrapper(methodWrapper);
                         methodWrapper.setMatcher(m);
                         return methodWrapper;
                     } else {
@@ -413,25 +525,33 @@ public abstract class Bot {
      * Wrapper class for methods annotated with {@link Controller}.
      */
     private class MethodWrapper {
-        private Method method;
-        private String pattern;
+        private final Object controller;
+        private final Method method;
+        private final Pattern pattern;
+        private final String next;
         private Matcher matcher;
-        private String next;
+
+        public MethodWrapper(Object controller, Method method, Pattern
+            pattern, String next) {
+            super();
+            this.controller = controller;
+            this.method = method;
+            this.pattern = pattern;
+            this.next = next;
+        }
+
+        public MethodWrapper(MethodWrapper source) {
+            this(source.getController(), source.getMethod(), source
+                .getPattern(), source.getNext());
+            matcher = source.getMatcher();
+        }
 
         public Method getMethod() {
             return method;
         }
 
-        public void setMethod(Method method) {
-            this.method = method;
-        }
-
-        public String getPattern() {
+        public Pattern getPattern() {
             return pattern;
-        }
-
-        public void setPattern(String pattern) {
-            this.pattern = pattern;
         }
 
         public Matcher getMatcher() {
@@ -446,8 +566,8 @@ public abstract class Bot {
             return next;
         }
 
-        public void setNext(String next) {
-            this.next = next;
+        public Object getController() {
+            return controller;
         }
 
         @Override
@@ -458,6 +578,7 @@ public abstract class Bot {
             MethodWrapper that = (MethodWrapper) o;
 
             if (!method.equals(that.method)) return false;
+            if (!controller.equals(that.controller)) return false;
             if (pattern != null ? !pattern.equals(that.pattern) : that.pattern != null) return false;
             if (matcher != null ? !matcher.equals(that.matcher) : that.matcher != null) return false;
             return next != null ? next.equals(that.next) : that.next == null;
@@ -467,6 +588,7 @@ public abstract class Bot {
         @Override
         public int hashCode() {
             int result = method.hashCode();
+            result = 31 * result + controller.hashCode();
             result = 31 * result + (pattern != null ? pattern.hashCode() : 0);
             result = 31 * result + (matcher != null ? matcher.hashCode() : 0);
             result = 31 * result + (next != null ? next.hashCode() : 0);
